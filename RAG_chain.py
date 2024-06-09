@@ -10,8 +10,12 @@ import torch
 import transformers
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.callbacks import StdOutCallbackHandler
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
 
 def read_docs(folder_path):
@@ -83,18 +87,21 @@ def generate_model(model_id):
     model.eval()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
     return model, tokenizer
 
-def create_pipeline(model, tokenizer):
+def create_pipeline(model, tokenizer, temperature, repetition_penalty, max_new_tokens):
 
     pipeline = transformers.pipeline(
         model=model,
         tokenizer=tokenizer,
         task="text-generation",
         return_full_text=True,
-        temperature=0.5,
-        max_new_tokens=256
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        repetition_penalty=repetition_penalty,
     )
 
     llm_pipeline = HuggingFacePipeline(pipeline=pipeline)
@@ -103,9 +110,9 @@ def create_pipeline(model, tokenizer):
 
 
 def create_qa_RAG_chain(llm_pipeline, retriever, system_prompt):
-
     # https://api.python.langchain.com/en/latest/prompts/langchain_core.prompts.chat.ChatPromptTemplate.html
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt),
+                                               ("human", "{input}")])
 
     qa_chain = create_stuff_documents_chain(llm_pipeline, prompt)
     chain = create_retrieval_chain(retriever, qa_chain)
@@ -113,6 +120,75 @@ def create_qa_RAG_chain(llm_pipeline, retriever, system_prompt):
     return chain
 
 
+def create_qa_RAG_chain_history(llm_pipeline, retriever, system_prompt):
+    """
+    Creates a chain exploiting also the history of the LLM
+    :param llm_pipeline:
+    :param retriever: This should be an history aware retriever
+    :param system_prompt:
+    :return:
+    """
+    qa_prompt = ChatPromptTemplate.from_messages([("system", system_prompt),
+                                                  MessagesPlaceholder("chat_history"),
+                                                  ("human", "{input}")])
+
+    question_answer_chain = create_stuff_documents_chain(llm_pipeline, qa_prompt)
+    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+    return rag_chain
+
+
+def create_rephrase_history_chain(llm_pipeline, retriever, system_prompt):
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([("system", system_prompt),
+                                                               MessagesPlaceholder("chat_history"),
+                                                               ("human", "{input}")])
+
+    history_aware_retriever = create_history_aware_retriever(llm_pipeline, retriever, contextualize_q_prompt)
+
+    return history_aware_retriever
+
+
 def get_answer_RAG(qa_chain, question):
     answer = qa_chain.invoke({"input": question})["answer"]
     return answer
+
+
+def answer_LLM_only(model, tokenizer, query):
+    """
+    Answers a question by using only the knowledge contained inside the model, without using RAG.
+    The query in input will be executed as-is. If the model requires some tokens for instruction tuning, they must be included already when passing the query in input.
+    :param model: the model to use for generating the answer
+    :param tokenizer: tokenizer for the model
+    :param query: the query to be run
+    :return: the answer of the llm
+    """
+
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    query_tokenized = tokenizer.encode_plus(query, return_tensors="pt")["input_ids"].to('cuda')
+    answer_ids = model.generate(query_tokenized,
+                                max_new_tokens=256,
+                                do_sample=True)
+
+    decoded_answer = tokenizer.batch_decode(answer_ids)
+
+    return decoded_answer
+
+
+def create_conversational_chain(rag_chain):
+    store = {}
+    def get_session_history(session_id: str) -> BaseChatMessageHistory:
+        if session_id not in store:
+            store[session_id] = ChatMessageHistory()
+        return store[session_id]
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
+
+    return conversational_rag_chain
